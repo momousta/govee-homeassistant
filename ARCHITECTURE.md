@@ -32,7 +32,9 @@ custom_components/govee/
 ├── light.py                 # Light platform
 ├── scene.py                 # Scene platform
 ├── switch.py                # Switch platform (plugs, night light)
-├── sensor.py                # Sensor platform (rate limit, MQTT status)
+├── sensor.py                # Sensor platform (rate limit, MQTT status, leak battery)
+├── binary_sensor.py         # Binary sensor platform (leak moisture, connectivity)
+├── event.py                 # Event platform (leak sensor button presses)
 ├── button.py                # Button platform (refresh scenes)
 ├── services.py              # Custom services
 ├── repairs.py               # Repairs framework integration
@@ -189,7 +191,9 @@ UI updated immediately
 | `light` | GoveeLightEntity, GoveeSegmentLight | Main lights and RGBIC segments |
 | `scene` | GoveeSceneEntity | Dynamic scenes from Govee cloud |
 | `switch` | GoveePlugSwitchEntity, GoveeNightLightSwitchEntity | Smart plugs, night light toggle |
-| `sensor` | Rate limit, MQTT status | Diagnostic sensors |
+| `sensor` | Rate limit, MQTT status, leak battery, last wet, alert status | Diagnostic and leak sensors |
+| `binary_sensor` | Leak moisture, sensor online, gateway online | Leak detection and connectivity |
+| `event` | Button press | Leak sensor button press events |
 | `button` | Refresh scenes | Manual scene refresh |
 
 ---

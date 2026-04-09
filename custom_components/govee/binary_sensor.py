@@ -4,7 +4,7 @@ Exposes per-device connectivity status for each transport (Cloud REST
 API, AWS IoT MQTT, direct BLE) as CONNECTIVITY diagnostic entities.
 
 Entities are opt-in via the ``expose_transport_entities`` option to avoid
-creating 3×N diagnostic entities by default.
+creating 3Ã—N diagnostic entities by default.
 """
 
 from __future__ import annotations
@@ -20,14 +20,17 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity import DeviceInfo
 
 from .const import (
     CONF_EXPOSE_TRANSPORT_ENTITIES,
     DEFAULT_EXPOSE_TRANSPORT_ENTITIES,
 )
 from .coordinator import GoveeCoordinator
+from .models.device import GoveeLeakSensor, leak_sensor_device_info
 from .entity import GoveeEntity
 from .models import TransportKind
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -71,6 +74,13 @@ async def async_setup_entry(
             )
 
     if entities:
+
+    # Add leak sensor entities
+    for sensor in coordinator.leak_sensors.values():
+        entities.append(GoveeLeakBinarySensor(coordinator, sensor))
+        entities.append(GoveeLeakOnlineSensor(coordinator, sensor))
+        entities.append(GoveeLeakGatewayOnlineSensor(coordinator, sensor))
+
         async_add_entities(entities)
         _LOGGER.debug("Set up %d transport connectivity entities", len(entities))
 
@@ -111,7 +121,7 @@ class GoveeTransportConnectivity(GoveeEntity, BinarySensorEntity):
         """Connectivity sensors are available whenever the coordinator is.
 
         They report their own state (on/off) rather than inheriting the
-        main device's online flag — otherwise an offline device would
+        main device's online flag â€” otherwise an offline device would
         hide the very diagnostic needed to understand why.
         """
         return self.coordinator.last_update_success
@@ -132,3 +142,78 @@ class GoveeTransportConnectivity(GoveeEntity, BinarySensorEntity):
         if health.last_failure_reason is not None:
             attrs["last_failure_reason"] = health.last_failure_reason
         return attrs
+
+class GoveeLeakBinarySensor(CoordinatorEntity["GoveeCoordinator"], BinarySensorEntity):
+    """Binary sensor for Govee leak detection (MQTT real-time)."""
+
+    _attr_has_entity_name = True
+    _attr_device_class = BinarySensorDeviceClass.MOISTURE
+
+    def __init__(self, coordinator: GoveeCoordinator, sensor: GoveeLeakSensor) -> None:
+        super().__init__(coordinator)
+        self._sensor = sensor
+        self._attr_unique_id = f"{sensor.device_id}_leak"
+        self._attr_name = None  # Use device name
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(**leak_sensor_device_info(self._sensor, DOMAIN))
+
+    @property
+    def is_on(self) -> bool | None:
+        state = self.coordinator.leak_states.get(self._sensor.device_id)
+        return state.is_wet if state else None
+
+    @property
+    def available(self) -> bool:
+        return (
+            super().available and self._sensor.device_id in self.coordinator.leak_states
+        )
+
+
+class GoveeLeakOnlineSensor(CoordinatorEntity["GoveeCoordinator"], BinarySensorEntity):
+    """Binary sensor for leak sensor connectivity (BFF polling)."""
+
+    _attr_has_entity_name = True
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: GoveeCoordinator, sensor: GoveeLeakSensor) -> None:
+        super().__init__(coordinator)
+        self._sensor = sensor
+        self._attr_unique_id = f"{sensor.device_id}_online"
+        self._attr_name = "Online"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(**leak_sensor_device_info(self._sensor, DOMAIN))
+
+    @property
+    def is_on(self) -> bool | None:
+        state = self.coordinator.leak_states.get(self._sensor.device_id)
+        return state.online if state else None
+
+
+class GoveeLeakGatewayOnlineSensor(
+    CoordinatorEntity["GoveeCoordinator"], BinarySensorEntity
+):
+    """Binary sensor for gateway hub connectivity (BFF polling)."""
+
+    _attr_has_entity_name = True
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: GoveeCoordinator, sensor: GoveeLeakSensor) -> None:
+        super().__init__(coordinator)
+        self._sensor = sensor
+        self._attr_unique_id = f"{sensor.device_id}_gateway_online"
+        self._attr_name = "Gateway online"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(**leak_sensor_device_info(self._sensor, DOMAIN))
+
+    @property
+    def is_on(self) -> bool | None:
+        state = self.coordinator.leak_states.get(self._sensor.device_id)
+        return state.gateway_online if state else None

@@ -59,6 +59,7 @@ from .models import (
     TransportHealth,
     TransportKind,
 )
+from .models.device import GoveeLeakSensor, GoveeLeakSensorState
 from .models.commands import (
     BrightnessCommand,
     ColorCommand,
@@ -125,6 +126,10 @@ def _sku_from_ble_name(name: str | None) -> str | None:
         if part.startswith("H") and len(part) >= 4 and part[1:].isalnum():
             return part
     return None
+
+
+# BFF polling interval for leak sensor state (seconds)
+BFF_POLL_INTERVAL = 300  # 5 minutes
 
 
 class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
@@ -227,6 +232,18 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
 
         # Store original poll interval for restoring after rate limit backoff
         self._original_update_interval = timedelta(seconds=poll_interval)
+
+        # Leak sensor subsystem
+        # Maps sensor device_id -> GoveeLeakSensor metadata
+        self._leak_sensors: dict[str, GoveeLeakSensor] = {}
+        # Maps sensor device_id -> mutable state (wet/dry, battery, online, etc)
+        self._leak_states: dict[str, GoveeLeakSensorState] = {}
+        # Maps (hub_device_id, sno) -> sensor device_id for MQTT dispatch
+        self._sno_to_sensor_id: dict[tuple[str, int], str] = {}
+        # Last button press event data (consumed by event entity)
+        self._last_button_press: dict[str, str] | None = None
+        # BFF poll timer handle
+        self._bff_poll_unsub: Any | None = None
 
     @property
     def devices(self) -> dict[str, GoveeDevice]:
@@ -360,6 +377,16 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
     def states(self) -> dict[str, GoveeDeviceState]:
         """Get current states for all devices."""
         return self._states
+
+    @property
+    def leak_sensors(self) -> dict[str, GoveeLeakSensor]:
+        """Get all discovered leak sensors."""
+        return self._leak_sensors
+
+    @property
+    def leak_states(self) -> dict[str, GoveeLeakSensorState]:
+        """Get current leak states (device_id -> state)."""
+        return self._leak_states
 
     def get_device(self, device_id: str) -> GoveeDevice | None:
         """Get device by ID."""
@@ -505,7 +532,8 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             )
         else:
             self._ble_devices[matched_id].set_ble_device_and_advertisement_data(
-                service_info.device, service_info.advertisement,
+                service_info.device,
+                service_info.advertisement,
             )
 
         # Stamp last-seen for the BLE connectivity sensor and notify entities.
@@ -539,6 +567,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             await self._start_mqtt()
             # Fetch device-specific MQTT topics for publishing commands
             await self._fetch_device_topics()
+
+        # Discover leak sensors via BFF API (requires email/password)
+        await self._discover_leak_sensors()
 
     async def _discover_devices(self) -> None:
         """Discover all devices from Govee API."""
@@ -659,6 +690,220 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         except Exception as err:
             _LOGGER.warning("Unexpected error fetching device topics: %s", err)
 
+    async def _discover_leak_sensors(self) -> None:
+        """Discover leak sensor sub-devices via BFF API.
+
+        Reuses the app2 IoT token (already obtained for MQTT) to call the
+        BFF device list endpoint. No additional login required.
+        """
+        if not self._iot_credentials:
+            return
+
+        try:
+            async with GoveeAuthClient() as auth_client:
+                sensor_data = await auth_client.fetch_bff_leak_sensors(
+                    self._iot_credentials.token
+                )
+
+            for sensor in sensor_data:
+                leak_sensor = GoveeLeakSensor(
+                    device_id=sensor["device_id"],
+                    name=sensor["name"],
+                    sku=sensor["sku"],
+                    hub_device_id=sensor["hub_device_id"],
+                    sno=sensor["sno"],
+                    hw_version=sensor.get("hw_version", ""),
+                    sw_version=sensor.get("sw_version", ""),
+                )
+                self._leak_sensors[leak_sensor.device_id] = leak_sensor
+
+                # Initialize state from BFF data
+                state = GoveeLeakSensorState()
+                state.battery = sensor.get("battery")
+                state.online = sensor.get("online", True)
+                state.gateway_online = sensor.get("gateway_online", True)
+                state.last_wet_time = sensor.get("last_wet_time")
+                state.read = sensor.get("read", True)
+                self._leak_states[leak_sensor.device_id] = state
+
+                self._sno_to_sensor_id[(leak_sensor.hub_device_id, leak_sensor.sno)] = (
+                    leak_sensor.device_id
+                )
+
+            if self._leak_sensors:
+                _LOGGER.info(
+                    "Discovered %d leak sensors across %d hubs",
+                    len(self._leak_sensors),
+                    len({s.hub_device_id for s in self._leak_sensors.values()}),
+                )
+                # Start periodic BFF polling (every 5 minutes)
+                self._schedule_bff_poll()
+
+        except Exception as err:
+            _LOGGER.warning("Failed to discover leak sensors: %s", err)
+            # Non-fatal: integration continues without leak sensors
+
+    def _schedule_bff_poll(self) -> None:
+        """Schedule the next BFF poll in 5 minutes."""
+        from homeassistant.helpers.event import async_call_later
+
+        if self._bff_poll_unsub:
+            self._bff_poll_unsub()
+        self._bff_poll_unsub = async_call_later(
+            self.hass, BFF_POLL_INTERVAL, self._bff_poll_callback
+        )
+
+    async def _bff_poll_callback(self, _now: Any = None) -> None:
+        """Callback for periodic BFF polling."""
+        await self._poll_bff_leak_state()
+        # Re-schedule next poll
+        self._schedule_bff_poll()
+
+    async def _poll_bff_leak_state(self) -> None:
+        """Poll BFF API for updated leak sensor state (battery, online, etc).
+
+        Called every 5 minutes and after MQTT events.
+        Reuses the app2 IoT token from initial login.
+        """
+        if not self._leak_sensors or not self._iot_credentials:
+            return
+
+        try:
+            async with GoveeAuthClient() as auth_client:
+                sensor_data = await auth_client.fetch_bff_leak_sensors(
+                    self._iot_credentials.token
+                )
+        except Exception as err:
+            _LOGGER.debug("BFF poll failed: %s", err)
+            return
+
+        # Update state for each known sensor
+        now_s = time.time()
+        now_ms = int(now_s * 1000)
+        for sensor in sensor_data:
+            device_id = sensor["device_id"]
+            state = self._leak_states.get(device_id)
+            if state is None:
+                continue
+
+            state.battery = sensor.get("battery")
+            state.online = sensor.get("online", True)
+            state.gateway_online = sensor.get("gateway_online", True)
+            # Only update last_wet_time if BFF has a newer timestamp than
+            # what we already have (e.g. from an MQTT event). This prevents
+            # a stale cloud value from overwriting a fresh MQTT-set timestamp.
+            bff_wet_time = sensor.get("last_wet_time")
+            if bff_wet_time and (
+                state.last_wet_time is None or bff_wet_time > state.last_wet_time
+            ):
+                state.last_wet_time = bff_wet_time
+            state.read = sensor.get("read", True)
+
+            # Fallback wet detection: if BFF shows a recent leak event
+            # within the poll window but MQTT never reported wet during that
+            # period, force it on. This covers MQTT disconnects or lost packets.
+            last_wet = sensor.get("last_wet_time") or 0
+            age_ms = now_ms - last_wet if last_wet > 0 else float("inf")
+            poll_window_ms = BFF_POLL_INTERVAL * 1000
+            mqtt_wet_age = now_s - state.last_mqtt_wet_at
+
+            if age_ms < poll_window_ms and mqtt_wet_age > BFF_POLL_INTERVAL:
+                sensor_obj = self._leak_sensors.get(device_id)
+                sensor_name = sensor_obj.name if sensor_obj else device_id
+                _LOGGER.warning(
+                    "BFF fallback: '%s' has unread leak from %ds ago "
+                    "but MQTT didn't report wet in the last %ds — forcing wet",
+                    sensor_name,
+                    int(age_ms / 1000),
+                    BFF_POLL_INTERVAL,
+                )
+                state.is_wet = True
+
+        # Trigger HA update
+        self.async_set_updated_data(self._states)
+
+    @callback
+    def _handle_leak_event(self, state_data: dict[str, Any]) -> None:
+        """Handle a decoded leak event from MQTT multiSync message.
+
+        Maps (hub_device_id, sensor_slot) to a sensor device_id and
+        updates the leak state. Triggers coordinator data update.
+        """
+        hub_id = state_data["hub_device_id"]
+        sno = state_data["sensor_slot"]
+        is_wet = state_data["is_wet"]
+
+        sensor_id = self._sno_to_sensor_id.get((hub_id, sno))
+        if not sensor_id:
+            _LOGGER.debug(
+                "Leak event for unknown sensor: hub=%s slot=%d wet=%s",
+                hub_id,
+                sno,
+                is_wet,
+            )
+            return
+
+        state = self._leak_states.get(sensor_id)
+        if state is None:
+            return
+
+        prev_wet = state.is_wet
+        state.is_wet = is_wet
+
+        if is_wet:
+            state.last_mqtt_wet_at = time.time()
+            # Set last_wet_time immediately so the "Last leak detected"
+            # sensor updates without waiting for the next BFF poll.
+            state.last_wet_time = int(time.time() * 1000)
+
+        if prev_wet != is_wet:
+            sensor = self._leak_sensors.get(sensor_id)
+            sensor_name = sensor.name if sensor else sensor_id
+            _LOGGER.info(
+                "Leak sensor '%s' changed: %s -> %s",
+                sensor_name,
+                "wet" if prev_wet else "dry",
+                "wet" if is_wet else "dry",
+            )
+
+        # Trigger HA state update for all entities
+        self.async_set_updated_data(self._states)
+
+        # Also trigger a BFF poll to refresh battery/online after event
+        self.hass.async_create_task(self._poll_bff_leak_state())
+
+    @callback
+    def _handle_button_press(self, state_data: dict[str, Any]) -> None:
+        """Handle a button press event from MQTT multiSync message.
+
+        Button press packets encode the sensor MAC in bytes 2-9 (reversed),
+        unlike leak events which use a slot number.
+        Fires a Home Assistant event so automations can trigger on it.
+        """
+        sensor_id = state_data["device_id"]
+
+        if sensor_id not in self._leak_sensors:
+            _LOGGER.debug(
+                "Button press for unknown sensor: %s",
+                sensor_id,
+            )
+            return
+
+        sensor = self._leak_sensors[sensor_id]
+
+        _LOGGER.info("Button pressed on leak sensor '%s'", sensor.name)
+
+        # Fire event for the event entity to pick up
+        self._last_button_press = {
+            "device_id": sensor_id,
+            "sensor_name": sensor.name,
+        }
+        # Trigger HA state update so event entity gets notified
+        self.async_set_updated_data(self._states)
+
+        # Also trigger a BFF poll to refresh alert status after button press
+        self.hass.async_create_task(self._poll_bff_leak_state())
+
     @callback
     def _on_mqtt_state_update(self, device_id: str, state_data: dict[str, Any]) -> None:
         """Handle state update from MQTT.
@@ -667,6 +912,16 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         loop. Safe to call async_set_updated_data() directly. The @callback
         decorator documents this event-loop-only contract.
         """
+        # Handle leak sensor events (from multiSync messages)
+        if state_data.get("_leak_event"):
+            self._handle_leak_event(state_data)
+            return
+
+        # Handle button press events
+        if state_data.get("_button_press"):
+            self._handle_button_press(state_data)
+            return
+
         if device_id not in self._devices:
             _LOGGER.debug("MQTT update for unknown device: %s", device_id)
             return
@@ -1066,7 +1321,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                 await ble_device.set_brightness(command.brightness)
             elif isinstance(command, ColorCommand):
                 await ble_device.set_rgb(
-                    command.color.r, command.color.g, command.color.b,
+                    command.color.r,
+                    command.color.g,
+                    command.color.b,
                 )
             else:
                 # Not BLE-capable (scenes, color_temp, work modes, etc.)
@@ -1612,6 +1869,10 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         for ble_device in self._ble_devices.values():
             await ble_device.stop()
         self._ble_devices.clear()
+
+        if self._bff_poll_unsub:
+            self._bff_poll_unsub()
+            self._bff_poll_unsub = None
 
         if self._mqtt_client:
             await self._mqtt_client.async_stop()

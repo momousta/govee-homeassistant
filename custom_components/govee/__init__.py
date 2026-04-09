@@ -57,6 +57,7 @@ PLATFORMS: list[Platform] = [
     Platform.SWITCH,
     Platform.SENSOR,
     Platform.BINARY_SENSOR,
+    Platform.EVENT,  # Leak sensor button presses
     Platform.BUTTON,
 ]
 
