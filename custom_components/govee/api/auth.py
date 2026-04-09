@@ -32,6 +32,8 @@ from .exceptions import (
     GoveeLoginRejectedError,
 )
 
+from ..models.device import LEAK_SENSOR_SKUS
+
 _LOGGER = logging.getLogger(__name__)
 
 # Fields that should be redacted in debug logs (contain credentials/secrets)
@@ -84,6 +86,7 @@ GOVEE_VERIFICATION_URL = (
 )
 GOVEE_IOT_KEY_URL = "https://app2.govee.com/app/v1/account/iot/key"
 GOVEE_DEVICE_LIST_URL = "https://app2.govee.com/device/rest/devices/v1/list"
+GOVEE_BFF_DEVICE_LIST_URL = "https://app2.govee.com/bff-app/v1/device/list"
 GOVEE_CLIENT_TYPE = "1"
 GOVEE_APP_VERSION = "7.4.10"
 GOVEE_IOT_VERSION = "0"
@@ -428,6 +431,149 @@ class GoveeAuthClient:
         except aiohttp.ClientError as err:
             raise GoveeApiError(
                 f"Connection error fetching device topics: {err}"
+            ) from err
+
+    async def fetch_bff_leak_sensors(
+        self,
+        token: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch leak sensor sub-devices from the BFF device list API.
+
+        The BFF API returns rich device data including sub-devices like
+        H5058 leak sensors with their slot number (sno), battery level,
+        and gateway information.
+
+        Args:
+            token: Authentication token (from app2 login).
+
+        Returns:
+            List of dicts, each with keys:
+            - device_id: Sensor MAC address
+            - name: User-assigned device name
+            - sku: Device model (e.g., "H5058")
+            - hub_device_id: Gateway hub device ID
+            - sno: Sensor slot number on hub (maps to MQTT byte 2)
+
+        Raises:
+            GoveeApiError: If the request fails.
+        """
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+            self._owns_session = True
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "appVersion": GOVEE_APP_VERSION,
+            "clientType": GOVEE_CLIENT_TYPE,
+            "iotVersion": GOVEE_IOT_VERSION,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        try:
+            async with self._session.get(
+                GOVEE_BFF_DEVICE_LIST_URL,
+                headers=headers,
+            ) as response:
+                data = await response.json()
+
+                if response.status != 200:
+                    message = data.get("message", f"HTTP {response.status}")
+                    raise GoveeApiError(
+                        f"BFF device list failed: {message}",
+                        code=response.status,
+                    )
+
+                sensors: list[dict[str, Any]] = []
+                devices = data.get("data", {}).get("devices", [])
+                for device in devices:
+                    sku = device.get("sku", "")
+                    if sku not in LEAK_SENSOR_SKUS:
+                        continue
+
+                    device_id = device.get("device", "")
+                    name = device.get("deviceName", sku)
+
+                    # Extract settings for sno and gateway info
+                    # deviceExt fields may be JSON strings that need parsing
+                    device_ext = device.get("deviceExt", {})
+                    if isinstance(device_ext, str):
+                        try:
+                            device_ext = json.loads(device_ext)
+                        except (json.JSONDecodeError, TypeError):
+                            device_ext = {}
+
+                    device_settings = device_ext.get("deviceSettings", {})
+                    if isinstance(device_settings, str):
+                        try:
+                            device_settings = json.loads(device_settings)
+                        except (json.JSONDecodeError, TypeError):
+                            device_settings = {}
+
+                    sno = device_settings.get("sno")
+                    if sno is None:
+                        _LOGGER.debug(
+                            "Leak sensor %s (%s) has no sno, skipping",
+                            name,
+                            device_id,
+                        )
+                        continue
+
+                    # Get gateway (hub) device ID
+                    gateway_info = device_settings.get("gatewayInfo", {})
+                    hub_device_id = gateway_info.get("device", "")
+
+                    sensors.append(
+                        {
+                            "device_id": device_id,
+                            "name": name,
+                            "sku": sku,
+                            "hub_device_id": hub_device_id,
+                            "sno": int(sno),
+                            "battery": device_settings.get("battery"),
+                            "hw_version": device_settings.get("versionHard", ""),
+                            "sw_version": device_settings.get("versionSoft", ""),
+                        }
+                    )
+
+                # Also extract lastDeviceData for state
+                # Second pass to attach state data
+                device_state_map: dict[str, dict[str, Any]] = {}
+                for device in devices:
+                    sku = device.get("sku", "")
+                    if sku not in LEAK_SENSOR_SKUS:
+                        continue
+                    device_id = device.get("device", "")
+                    device_ext = device.get("deviceExt", {})
+                    if isinstance(device_ext, str):
+                        try:
+                            device_ext = json.loads(device_ext)
+                        except (json.JSONDecodeError, TypeError):
+                            device_ext = {}
+                    ld = device_ext.get("lastDeviceData", {})
+                    if isinstance(ld, str):
+                        try:
+                            ld = json.loads(ld)
+                        except (json.JSONDecodeError, TypeError):
+                            ld = {}
+                    device_state_map[device_id] = ld
+
+                # Attach state to sensor dicts
+                for sensor in sensors:
+                    ld = device_state_map.get(sensor["device_id"], {})
+                    sensor["online"] = ld.get("online", True)
+                    sensor["gateway_online"] = ld.get("gwonline", True)
+                    sensor["last_wet_time"] = ld.get("lastTime")
+                    sensor["read"] = ld.get("read", True)
+
+                _LOGGER.info(
+                    "Discovered %d leak sensors from BFF API", len(sensors)
+                )
+                return sensors
+
+        except aiohttp.ClientError as err:
+            raise GoveeApiError(
+                f"Connection error fetching BFF device list: {err}"
             ) from err
 
     async def request_verification_code(

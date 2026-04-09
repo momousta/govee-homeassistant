@@ -56,6 +56,8 @@ PLATFORMS: list[Platform] = [
     Platform.FAN,  # Fan devices
     Platform.SWITCH,
     Platform.SENSOR,
+    Platform.BINARY_SENSOR,  # Leak sensors
+    Platform.EVENT,  # Leak sensor button presses
     Platform.BUTTON,
 ]
 

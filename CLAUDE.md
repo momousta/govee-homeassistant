@@ -50,14 +50,16 @@ custom_components/govee/
 ├── light.py             # Light platform
 ├── select.py            # Scene/DIY/HDMI/music mode selectors
 ├── switch.py            # Switch platform (plugs, night light, music, DreamView)
-├── sensor.py            # Diagnostic sensors
+├── sensor.py            # Diagnostic sensors + leak battery/alert
+├── binary_sensor.py     # Leak moisture detection, connectivity
+├── event.py             # Leak sensor button press events
 ├── button.py            # Refresh scenes button
 ├── services.py          # Custom services
 ├── repairs.py           # Repairs framework integration
 ├── diagnostics.py       # Diagnostics for troubleshooting
 ├── const.py             # Constants
 ├── models/              # Domain models (frozen dataclasses)
-│   ├── device.py        # GoveeDevice, GoveeCapability
+│   ├── device.py        # GoveeDevice, GoveeCapability, GoveeLeakSensor
 │   ├── state.py         # GoveeDeviceState, RGBColor
 │   └── commands.py      # Command pattern implementations
 ├── protocols/           # Protocol interfaces (Clean Architecture)
