@@ -81,7 +81,8 @@
           "poll_interval": "Polling interval (seconds)",
           "enable_groups": "Enable group devices",
           "enable_scenes": "Enable scene selector",
-          "enable_diy_scenes": "Enable DIY scene selector"
+          "enable_diy_scenes": "Enable DIY scene selector",
+          "expose_transport_entities": "Expose per-device transport connectivity sensors"
         }
       },
       "select_segment_devices": {
@@ -149,6 +150,9 @@
       },
       "govee_heater_auto_stop": {
         "name": "Auto Stop"
+      },
+      "govee_appliance_power": {
+        "name": "{device_name}"
       }
     },
     "sensor": {
@@ -157,6 +161,17 @@
       },
       "mqtt_status": {
         "name": "MQTT Status"
+      }
+    },
+    "binary_sensor": {
+      "cloud_api_connectivity": {
+        "name": "Cloud API"
+      },
+      "mqtt_connectivity": {
+        "name": "MQTT"
+      },
+      "ble_connectivity": {
+        "name": "Bluetooth"
       }
     },
     "button": {

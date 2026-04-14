@@ -39,6 +39,7 @@ from .const import (
     CONF_ENABLE_GROUPS,
     CONF_ENABLE_SCENES,
     CONF_ENABLE_SEGMENTS,
+    CONF_EXPOSE_TRANSPORT_ENTITIES,
     CONF_PASSWORD,
     CONF_POLL_INTERVAL,
     CONF_SEGMENT_MODE,
@@ -47,6 +48,7 @@ from .const import (
     DEFAULT_ENABLE_GROUPS,
     DEFAULT_ENABLE_SCENES,
     DEFAULT_ENABLE_SEGMENTS,
+    DEFAULT_EXPOSE_TRANSPORT_ENTITIES,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_SEGMENT_MODE,
     DOMAIN,
@@ -256,6 +258,10 @@ class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             code = user_input["verification_code"].strip()
+            if self._email is None or self._password is None:
+                # Defensive — the verification step should never be reached
+                # without these already set by the preceding account step.
+                return self.async_abort(reason="missing_credentials")
             try:
                 self._iot_credentials = await validate_govee_credentials(
                     self._email,
@@ -643,6 +649,13 @@ class GoveeOptionsFlow(OptionsFlow):
                         CONF_ENABLE_DIY_SCENES,
                         default=options.get(
                             CONF_ENABLE_DIY_SCENES, DEFAULT_ENABLE_DIY_SCENES
+                        ),
+                    ): bool,
+                    vol.Optional(
+                        CONF_EXPOSE_TRANSPORT_ENTITIES,
+                        default=options.get(
+                            CONF_EXPOSE_TRANSPORT_ENTITIES,
+                            DEFAULT_EXPOSE_TRANSPORT_ENTITIES,
                         ),
                     ): bool,
                 }
