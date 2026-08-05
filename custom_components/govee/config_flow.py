@@ -32,6 +32,7 @@ from .api import (
 )
 from .api.auth import _derive_client_id
 from .api.client import validate_api_key
+from .coordinator import reset_login_budget
 from .const import (
     CONF_API_KEY,
     CONF_API_TEMPERATURE_UNIT,
@@ -67,6 +68,23 @@ from .const import (
 from .api.lan import LanTargetError, expand_lan_targets
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _carry_forward_iot_keys(entry: ConfigEntry, new_data: dict[str, Any]) -> None:
+    """Copy the credential keys the cache/clear helpers just wrote to the entry.
+
+    Those helpers update the live entry, but ``new_data`` was snapshotted before
+    they ran. Submitting the snapshot would restore the stale token and undo the
+    reconfigure the user just performed.
+    """
+    if KEY_IOT_CREDENTIALS in entry.data:
+        new_data[KEY_IOT_CREDENTIALS] = entry.data[KEY_IOT_CREDENTIALS]
+    else:
+        new_data.pop(KEY_IOT_CREDENTIALS, None)
+    if KEY_IOT_LOGIN_FAILED in entry.data:
+        new_data[KEY_IOT_LOGIN_FAILED] = entry.data[KEY_IOT_LOGIN_FAILED]
+    else:
+        new_data.pop(KEY_IOT_LOGIN_FAILED, None)
 
 
 def _validate_api_key_format(api_key: str) -> tuple[str, str | None]:
@@ -296,9 +314,11 @@ class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
                     # Pre-cache the IoT credentials so the reload
                     # doesn't try to login again (which would hit 2FA)
                     self._cache_iot_credentials(reconfigure_entry.entry_id)
+                    _carry_forward_iot_keys(reconfigure_entry, new_data)
+                    reset_login_budget(reconfigure_entry.entry_id)
                     return self.async_update_reload_and_abort(
                         reconfigure_entry,
-                        data_updates=new_data,
+                        data=new_data,
                     )
                 return self._create_entry()
 
@@ -592,10 +612,12 @@ class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
                         self._clear_mqtt_cache(reconfigure_entry.entry_id)
                         # Pre-cache IoT credentials so reload doesn't re-login
                         self._cache_iot_credentials(reconfigure_entry.entry_id)
+                        _carry_forward_iot_keys(reconfigure_entry, new_data)
+                        reset_login_budget(reconfigure_entry.entry_id)
 
                         return self.async_update_reload_and_abort(
                             reconfigure_entry,
-                            data_updates=new_data,
+                            data=new_data,
                         )
 
                 except GoveeAuthError as err:

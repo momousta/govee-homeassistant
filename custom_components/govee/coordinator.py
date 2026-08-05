@@ -10,9 +10,10 @@ import asyncio
 import dataclasses
 import logging
 import time
-from collections.abc import Awaitable, Mapping
+from collections import deque
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, TypeVar
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
@@ -23,12 +24,15 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .api import (
+    Govee2FACodeInvalidError,
+    Govee2FARequiredError,
     GoveeApiClient,
     GoveeApiError,
     GoveeAuthError,
     GoveeAwsIotClient,
     GoveeDeviceNotFoundError,
     GoveeIotCredentials,
+    GoveeLoginRejectedError,
     GoveeRateLimitError,
 )
 from .api.auth import GoveeAuthClient
@@ -65,11 +69,15 @@ from .api.lan_client import (
 )
 from .api.lan_control import command_to_lan, lan_brightness_to_device
 from .const import (
+    CONF_EMAIL,
     CONF_ENABLE_MQTT_CONTROL,
     CONF_LAN_TARGETS,
+    CONF_PASSWORD,
     DEFAULT_ENABLE_MQTT_CONTROL,
     DEVICE_REDISCOVERY_INTERVAL,
     DOMAIN,
+    KEY_IOT_CREDENTIALS,
+    KEY_IOT_LOGIN_FAILED,
     LAN_CORRELATION_TTL_SECONDS,
     LAN_READ_MISS_DEMOTE_THRESHOLD,
     LAN_RESCAN_INTERVAL,
@@ -116,9 +124,11 @@ from .models.device import (
 from .models.device import GoveeLeakSensor, GoveeLeakSensorState
 from .scene_cache import SceneCacheManager
 from .repairs import (
+    async_create_account_auth_issue,
     async_create_auth_issue,
     async_create_mqtt_issue,
     async_create_rate_limit_issue,
+    async_delete_account_auth_issue,
     async_delete_auth_issue,
     async_delete_mqtt_issue,
     async_delete_rate_limit_issue,
@@ -155,6 +165,54 @@ BFF_POLL_INTERVAL = 300  # 5 minutes
 # #62); a leak surfaces with up to this much latency. Kept conservative because
 # the account API's rate limit is unverified (homebridge issue #543).
 WATER_DETECTOR_POLL_INTERVAL = 120  # 2 minutes
+
+# Cooldown after a failed account re-login. Govee rate-limits login to 30
+# attempts per 24h (see GoveeAuthClient) and the account-token pollers tick as
+# often as every 2 minutes, so no failure may retry on every tick.
+#
+# A transient failure starts at 5 minutes and doubles up to the hour cap, so a
+# blip recovers quickly while a *consecutive* outage decays to 5+10+20+40
+# minutes then hourly. That paces the common case; LOGIN_BUDGET_MAX below is
+# what actually bounds the total, including patterns that break the streak.
+# A durable failure needs the user to act, so it waits the cap outright.
+TOKEN_REFRESH_BACKOFF = 3600  # 1 hour, also the ceiling for the transient ramp
+TOKEN_REFRESH_TRANSIENT_BACKOFF = 300  # 5 minutes, doubled per consecutive fail
+
+# Hard ceiling on logins in a rolling window, kept under Govee's documented 30
+# so setup and reconfigure still have room. The ramp only paces *consecutive*
+# failures; this is what holds when they are not consecutive — a login that
+# succeeds but yields a token the BFF still rejects resets the ramp, and would
+# otherwise re-login on every poll tick.
+LOGIN_BUDGET_WINDOW = 86400  # 24 hours
+LOGIN_BUDGET_MAX = 25
+
+# Keyed by entry_id at module scope so the budget outlives the coordinator.
+# Instance state (and hass.data[DOMAIN], which async_unload_entry clears) is
+# discarded on every reload — including the manual and options-change reloads a
+# user reaches for when sensors look stuck, which is exactly when an exhausted
+# budget must not silently reset.
+_LOGIN_ATTEMPTS: dict[str, deque[float]] = {}
+
+
+def reset_login_budget(entry_id: str) -> None:
+    """Clear an entry's login budget after the user supplies new credentials.
+
+    Without an entitled reset actor the only way out of an exhausted budget is
+    a process restart, which is not a supportable contract for a rate limiter.
+    """
+    _LOGIN_ATTEMPTS.pop(entry_id, None)
+
+
+# Login failures that re-login cannot clear by itself.
+DURABLE_LOGIN_ERRORS = (
+    GoveeAuthError,
+    GoveeLoginRejectedError,
+    Govee2FARequiredError,
+    Govee2FACodeInvalidError,
+    GoveeRateLimitError,
+)
+
+_T = TypeVar("_T")
 
 # Delay before re-polling device state after a humidifier work_mode/humidity
 # write, to attach a timestamped "what Govee reports N seconds later" snapshot
@@ -316,6 +374,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         self._battery_reload_scheduled = False
         # Leak sensor subsystem
         self._leak_sensors: dict[str, GoveeLeakSensor] = {}
+        # Discovery is one-shot at startup. If it fails, nothing else re-runs it
+        # and leak state stays empty until a manual reload.
+        self._leak_discovery_retry_pending = False
         self._leak_states: dict[str, GoveeLeakSensorState] = {}
         # BFF-discovered thermo-hygrometers (H5301, issue #86): synthesized into
         # self._devices but absent from the Developer API, so their state is
@@ -345,6 +406,14 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         self._pending_button_presses: dict[str, int] = {}
         self._bff_poll_unsub: CALLBACK_TYPE | None = None
         self._bff_poll_task: asyncio.Task[None] | None = None
+        # Serializes account re-login so overlapping pollers raise one login.
+        self._token_refresh_lock = asyncio.Lock()
+        self._token_refresh_blocked_until = 0.0
+        self._token_refresh_failures = 0
+        # Compared by the update listener so a data-only write skips the reload.
+        self.options_snapshot: dict[str, Any] = dict(config_entry.options)
+        # True once an account-token call has exhausted its refresh retry.
+        self._account_auth_failed = False
         # Standalone water-detector (H5054) leak polling (issue #62).
         self._wd_poll_unsub: CALLBACK_TYPE | None = None
         # Last seen lastTime per detector — warnMessage is only called when the
@@ -722,6 +791,28 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         """
         return device_id in self._bff_thermometer_ids
 
+    @property
+    def _login_attempts(self) -> deque[float]:
+        """Account login timestamps, shared across reloads of this entry."""
+        return _LOGIN_ATTEMPTS.setdefault(self._config_entry.entry_id, deque())
+
+    async def _note_account_auth_failed(self) -> None:
+        """Surface the transition once rather than on every poll.
+
+        A log line is not a terminal state. The Developer-API path raises a
+        fixable card for the same condition, and this one needs the user just as
+        much: leak data is account-only, so it goes stale invisibly otherwise.
+        """
+        if self._account_auth_failed:
+            return
+        self._account_auth_failed = True
+        _LOGGER.warning(
+            "Govee account authentication is failing; data that only the "
+            "account API provides will go stale. Reconfigure the integration "
+            "if this persists"
+        )
+        await async_create_account_auth_issue(self.hass, self._config_entry)
+
     def is_water_detector(self, device_id: str) -> bool:
         """Return True if this device is a standalone water detector (H5054).
 
@@ -778,8 +869,8 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                 await coro
         except TimeoutError:
             _LOGGER.warning(
-                "Startup step %r did not complete within %ss; continuing without "
-                "it (it will retry on the next poll)",
+                "Startup step %r did not complete within %ss; continuing "
+                "without it",
                 name,
                 STARTUP_STEP_TIMEOUT,
             )
@@ -1551,20 +1642,186 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             return
 
         try:
-            async with GoveeAuthClient(hass=self.hass) as auth_client:
-                self._device_topics = await auth_client.fetch_device_topics(
-                    self._iot_credentials.token
-                )
-                _LOGGER.info(
-                    "Fetched MQTT topics for %d devices",
-                    len(self._device_topics),
-                )
+            self._device_topics = await self._run_account_call(
+                lambda client, token: client.fetch_device_topics(token)
+            )
+            _LOGGER.info(
+                "Fetched MQTT topics for %d devices",
+                len(self._device_topics),
+            )
         except GoveeApiError as err:
             _LOGGER.warning("Failed to fetch device topics: %s", err)
             # Continue without device topics - ptReal commands won't work
             # but the integration can still function with polling
         except Exception as err:
             _LOGGER.warning("Unexpected error fetching device topics: %s", err)
+
+    async def _async_refresh_iot_token(self) -> bool:
+        """Re-login to replace an expired account bearer token.
+
+        The BFF endpoints authenticate with the short-lived account token in
+        ``self._iot_credentials``, which is cached in ``entry.data`` and reused
+        across restarts. Once Govee expires it (observed after a few weeks) the
+        cached copy is dead, and nothing else refreshes it — the MQTT transport
+        keeps working off its long-lived P12 certificate, so the failure is
+        invisible until leak entities drop out.
+
+        Serialized so overlapping pollers raise at most one login between them,
+        and rate-limited on failure: Govee allows only 30 logins per 24h, and
+        the callers here tick as often as every 2 minutes. A refresh that fails
+        for a reason re-login can't clear (e.g. ``Govee2FARequiredError``, which
+        needs a user-supplied code via reconfigure) must not retry every tick.
+
+        Returns:
+            True if usable credentials are in place, False otherwise.
+        """
+        entry = self._config_entry
+        email = entry.data.get(CONF_EMAIL)
+        password = entry.data.get(CONF_PASSWORD)
+        if not (email and password):
+            return False
+
+        stale_token = self._iot_credentials.token if self._iot_credentials else None
+
+        async with self._token_refresh_lock:
+            # A concurrent caller may have refreshed while we waited.
+            current = self._iot_credentials.token if self._iot_credentials else None
+            if current is not None and current != stale_token:
+                return True
+
+            if time.time() < self._token_refresh_blocked_until:
+                _LOGGER.debug("Govee token refresh suppressed by backoff")
+                return False
+
+            now = time.time()
+            while (
+                self._login_attempts
+                and now - self._login_attempts[0] >= LOGIN_BUDGET_WINDOW
+            ):
+                self._login_attempts.popleft()
+            if len(self._login_attempts) >= LOGIN_BUDGET_MAX:
+                self._token_refresh_blocked_until = (
+                    self._login_attempts[0] + LOGIN_BUDGET_WINDOW
+                )
+                _LOGGER.warning(
+                    "Govee login budget spent (%d attempts in 24h); deferring "
+                    "token refresh until the window clears",
+                    len(self._login_attempts),
+                )
+                return False
+            self._login_attempts.append(now)
+
+            try:
+                async with GoveeAuthClient(hass=self.hass) as auth_client:
+                    # client_id is omitted: login() derives the same stable id
+                    # from the email, which is what Govee binds the token to.
+                    credentials = await auth_client.login(email, password)
+            except Exception as err:  # noqa: BLE001 - non-fatal, caller re-raises
+                self._token_refresh_failures += 1
+                durable = isinstance(err, DURABLE_LOGIN_ERRORS)
+                if durable:
+                    backoff = TOKEN_REFRESH_BACKOFF
+                else:
+                    backoff = min(
+                        TOKEN_REFRESH_TRANSIENT_BACKOFF
+                        * 2 ** (self._token_refresh_failures - 1),
+                        TOKEN_REFRESH_BACKOFF,
+                    )
+                self._token_refresh_blocked_until = time.time() + backoff
+                _LOGGER.warning(
+                    "Govee account token refresh failed (%s); not retrying for "
+                    "%ds.%s",
+                    err,
+                    backoff,
+                    " Reconfigure the integration if this persists." if durable else "",
+                )
+                return False
+
+            self._iot_credentials = credentials
+            self._token_refresh_blocked_until = 0.0
+            self._token_refresh_failures = 0
+            new_data = dict(entry.data)
+            new_data[KEY_IOT_CREDENTIALS] = dataclasses.asdict(credentials)
+            new_data.pop(KEY_IOT_LOGIN_FAILED, None)
+            self.hass.config_entries.async_update_entry(entry, data=new_data)
+            _LOGGER.info("Refreshed the Govee account token via re-login")
+            return True
+
+    async def _run_account_call(
+        self,
+        call: Callable[[GoveeAuthClient, str], Awaitable[_T]],
+    ) -> _T:
+        """Run an account-token BFF call, refreshing the token once on 401.
+
+        Every endpoint authenticated with the account bearer token shares the
+        same expiry failure, so recovery lives here rather than in any one
+        feature's poller. Recurring callers must route through this; startup
+        callers may also use it, and do where recovering during setup is worth
+        the extra login.
+
+        Args:
+            call: Receives an open auth client and the current account token.
+
+        Returns:
+            Whatever ``call`` returns.
+
+        Raises:
+            GoveeAuthError: Token was invalid and could not be refreshed.
+        """
+        try:
+            result = await self._run_account_call_once(call)
+        except GoveeAuthError:
+            if not await self._async_refresh_iot_token():
+                await self._note_account_auth_failed()
+                raise
+            try:
+                result = await self._run_account_call_once(call)
+            except GoveeAuthError:
+                await self._note_account_auth_failed()
+                raise
+        if self._account_auth_failed:
+            self._account_auth_failed = False
+            await async_delete_account_auth_issue(self.hass, self._config_entry)
+        return result
+
+    async def _run_account_call_once(
+        self,
+        call: Callable[[GoveeAuthClient, str], Awaitable[_T]],
+    ) -> _T:
+        """Run a single account-token call with a short-lived auth client."""
+        credentials = self._iot_credentials
+        if credentials is None:
+            raise GoveeAuthError("No Govee account credentials available")
+        # Short-lived client per call, consistent with _fetch_device_topics().
+        # The hass= param shares HA's managed aiohttp.ClientSession, so no new
+        # TCP connections are created.
+        async with GoveeAuthClient(hass=self.hass) as auth_client:
+            return await call(auth_client, credentials.token)
+
+    async def _fetch_bff_leak_snapshot(
+        self,
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+        """Fetch the BFF leak snapshot, refreshing the token once if expired.
+
+        Returns:
+            The ``(sensors, hubs, thermo_readings)`` tuple from the BFF API.
+
+        Raises:
+            GoveeAuthError: Token was invalid and could not be refreshed.
+        """
+
+        async def _call(
+            auth_client: GoveeAuthClient, token: str
+        ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+            result = await auth_client.fetch_bff_leak_sensors(token)
+            # Capture the PII-free census + skeleton before the client
+            # closes (#87).
+            self._bff_device_census = auth_client.bff_device_census()
+            self._bff_response_skeleton = auth_client.bff_response_skeleton()
+            self._bff_device_values = auth_client.bff_device_values()
+            return result
+
+        return await self._run_account_call(_call)
 
     async def _discover_leak_sensors(self) -> None:
         """Discover leak sensor sub-devices via BFF API.
@@ -1576,22 +1833,11 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             return
 
         try:
-            # Create a short-lived auth client per call, consistent with
-            # _fetch_device_topics(). The hass= param shares HA's managed
-            # aiohttp.ClientSession, so no new TCP connections are created.
-            async with GoveeAuthClient(hass=self.hass) as auth_client:
-                (
-                    sensor_data,
-                    hub_data,
-                    thermo_readings,
-                ) = await auth_client.fetch_bff_leak_sensors(
-                    self._iot_credentials.token
-                )
-                # Capture the PII-free census + skeleton before the client
-                # closes (#87).
-                self._bff_device_census = auth_client.bff_device_census()
-                self._bff_response_skeleton = auth_client.bff_response_skeleton()
-                self._bff_device_values = auth_client.bff_device_values()
+            (
+                sensor_data,
+                hub_data,
+                thermo_readings,
+            ) = await self._fetch_bff_leak_snapshot()
 
             self._leak_hubs = hub_data
             for sensor in sensor_data:
@@ -1647,14 +1893,35 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             # 0-100 int with no gateway-dependent scale (#83 follow-up).
             self._apply_bff_thermo_battery(thermo_readings)
 
+            # Correctness note: this reads _bff_device_census, which exists
+            # for #87 diagnostics. It works because it is 1:1 with the raw BFF
+            # device list and captured from this same response. If diagnostics
+            # ever trims or filters it, this arming silently breaks.
+            #
+            # A response that parsed is not a response that told us anything:
+            # an empty payload is indistinguishable from "no leak sensors" by
+            # the roster alone. The census lists every device the BFF returned
+            # whatever its type, so it separates "answered, none are leak
+            # sensors" (disarm) from "answered with nothing" (degraded, retry).
+            self._leak_discovery_retry_pending = not self._bff_device_census
+
             # Start the 5-min BFF poll if we have leak sensors OR thermometers
-            # whose readings we refresh via the BFF tickle (#83).
-            if self._leak_sensors or self._thermo_bff_devices:
+            # whose readings we refresh via the BFF tickle (#83), or if the read
+            # was degraded and still needs re-running.
+            if (
+                self._leak_sensors
+                or self._thermo_bff_devices
+                or self._leak_discovery_retry_pending
+            ):
                 self._schedule_bff_poll()
 
         except Exception as err:
             _LOGGER.warning("Failed to discover leak sensors: %s", err)
-            # Non-fatal: integration continues without leak sensors
+            # Non-fatal, but leak detection is empty until discovery succeeds,
+            # so arm the poll loop to re-run it. Retries inherit the login
+            # budget via _run_account_call, so this cannot become a hot loop.
+            self._leak_discovery_retry_pending = True
+            self._schedule_bff_poll()
 
     def _apply_bff_thermo_battery(
         self,
@@ -1753,15 +2020,19 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             return
 
         try:
-            async with GoveeAuthClient(hass=self.hass) as auth_client:
-                sensors = await auth_client.fetch_bff_thermo_hygrometers(
-                    self._iot_credentials.token
-                )
+
+            async def _call(
+                auth_client: GoveeAuthClient, token: str
+            ) -> list[dict[str, Any]]:
+                found = await auth_client.fetch_bff_thermo_hygrometers(token)
                 # Refresh the PII-free census so a diagnostics download shows the
                 # thermo-hygro SKU flags even when no leak sensors are present.
                 self._bff_device_census = auth_client.bff_device_census()
                 self._bff_response_skeleton = auth_client.bff_response_skeleton()
                 self._bff_device_values = auth_client.bff_device_values()
+                return found
+
+            sensors = await self._run_account_call(_call)
 
             for sensor in sensors:
                 device_id = sensor["device_id"]
@@ -1839,10 +2110,14 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             return
 
         try:
-            async with GoveeAuthClient(hass=self.hass) as auth_client:
-                sensors = await auth_client.fetch_bff_thermo_hygrometers(
-                    self._iot_credentials.token
-                )
+            sensors = await self._run_account_call(
+                lambda client, token: client.fetch_bff_thermo_hygrometers(token)
+            )
+        except GoveeAuthError as err:
+            # Reaching here means the retry refresh also failed, so readings go
+            # stale until credentials are fixed — too consequential for debug.
+            _LOGGER.warning("BFF thermo-hygrometer readings are stale: %s", err)
+            return
         except Exception as err:
             _LOGGER.debug("BFF thermo-hygrometer refresh failed: %s", err)
             return
@@ -1961,6 +2236,27 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
 
     async def _bff_poll_callback(self, _now: Any = None) -> None:
         """Callback for periodic BFF polling."""
+        if self._leak_discovery_retry_pending:
+            # Startup discovery failed; the roster is empty, so the poll below
+            # would early-return forever without this.
+            known = set(self._leak_sensors)
+            await self._discover_leak_sensors()
+            recovered = set(self._leak_sensors) - known
+            if recovered and not self._bff_reload_scheduled:
+                # Entities are only ever created during setup, and the poll's
+                # new-sensor diff below is empty because discovery just filled
+                # the roster it compares against. Without this the data comes
+                # back and the device still has no entity.
+                self._bff_reload_scheduled = True
+                _LOGGER.info(
+                    "Leak discovery recovered %d sensor(s) after failing at "
+                    "startup — reloading to create their entities",
+                    len(recovered),
+                )
+                self.hass.config_entries.async_schedule_reload(
+                    self._config_entry.entry_id
+                )
+                return
         await self._poll_bff_leak_state()
         # Refresh thermo-hygrometer readings on the same cadence (issue #86).
         await self._refresh_bff_thermometers()
@@ -1981,16 +2277,18 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             return
 
         try:
-            # Short-lived auth client, consistent with _fetch_device_topics()
-            # and _discover_leak_sensors(). hass= reuses HA's aiohttp session.
-            async with GoveeAuthClient(hass=self.hass) as auth_client:
-                (
-                    sensor_data,
-                    _hub_data,
-                    thermo_readings,
-                ) = await auth_client.fetch_bff_leak_sensors(
-                    self._iot_credentials.token
-                )
+            (
+                sensor_data,
+                _hub_data,
+                thermo_readings,
+            ) = await self._fetch_bff_leak_snapshot()
+        except GoveeAuthError as err:
+            _LOGGER.warning(
+                "Govee rejected the account token after a refresh; leak sensor "
+                "readings are stale: %s",
+                err,
+            )
+            return
         except Exception as err:
             _LOGGER.debug("BFF poll failed: %s", err)
             return
@@ -2118,16 +2416,21 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         if not detectors or not self._iot_credentials:
             return
 
-        token = self._iot_credentials.token
         device_ids = {d.device_id for d in detectors}
         sku_by_id = {d.device_id: d.sku for d in detectors}
 
         try:
-            async with GoveeAuthClient(hass=self.hass) as auth_client:
+            # Accumulated outside the closure because a refresh-retry re-runs
+            # it: state written on the first attempt compares equal the second
+            # time, which would drop the notification for a change that did
+            # happen and leave the UI stale until the next coordinator tick.
+            changed = False
+
+            async def _call(auth_client: GoveeAuthClient, token: str) -> bool:
+                nonlocal changed
                 states = await auth_client.fetch_water_detector_states(
                     token, device_ids
                 )
-                changed = False
                 for device_id, info in states.items():
                     state = self._states.get(device_id)
                     if state is None:
@@ -2147,6 +2450,10 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                             is_wet = await auth_client.fetch_leak_warning(
                                 token, device_id, sku_by_id[device_id]
                             )
+                        except GoveeAuthError:
+                            # Must reach _run_account_call so the token gets
+                            # refreshed rather than being logged and dropped.
+                            raise
                         except Exception as err:  # noqa: BLE001
                             _LOGGER.debug(
                                 "warnMessage poll failed for %s: %s", device_id, err
@@ -2177,6 +2484,16 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                         state.battery,
                         last_time,
                     )
+                return changed
+
+            changed = await self._run_account_call(_call)
+        except GoveeAuthError as err:
+            _LOGGER.warning(
+                "Govee rejected the account token after a refresh; water "
+                "detector readings are stale: %s",
+                err,
+            )
+            return
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("Water-detector poll failed: %s", err)
             return

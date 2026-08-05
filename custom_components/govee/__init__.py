@@ -504,8 +504,18 @@ async def _async_update_listener(
 ) -> None:
     """Handle options update.
 
-    Reloads the integration when options change.
+    Reloads the integration when options change. HA fires this for any entry
+    change, including the ``data``-only write a token refresh performs at
+    runtime; reloading for that tears down MQTT/LAN mid-operation and discards
+    the coordinator, so compare options and reload only when they moved.
     """
+    previous = getattr(entry.runtime_data, "options_snapshot", None)
+    current = dict(entry.options)
+    if previous == current:
+        _LOGGER.debug("Entry data changed without options; skipping reload")
+        return
+    entry.runtime_data.options_snapshot = current
+
     _LOGGER.info("Options changed, reloading integration")
     _LOGGER.debug("Current options: %s", entry.options)
 

@@ -24,6 +24,7 @@ _LOGGER = logging.getLogger(__name__)
 
 # Issue IDs
 ISSUE_AUTH_FAILED = "auth_failed"
+ISSUE_ACCOUNT_AUTH_FAILED = "account_auth_failed"
 ISSUE_RATE_LIMITED = "rate_limited"
 ISSUE_MQTT_DISCONNECTED = "mqtt_disconnected"
 
@@ -99,6 +100,42 @@ async def async_delete_rate_limit_issue(
         hass,
         DOMAIN,
         f"{ISSUE_RATE_LIMITED}_{entry.entry_id}",
+    )
+
+
+async def async_create_account_auth_issue(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> None:
+    """Flag account-credential death, which is a different repair to the API key.
+
+    Deliberately not fixable: the auth_failed Fix flow only collects an API key,
+    which cannot revive an expired account token. Sending the user there loops
+    them through "Fix, success, still blind". Account credentials live behind
+    Reconfigure, so the text sends them there instead.
+    """
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        f"{ISSUE_ACCOUNT_AUTH_FAILED}_{entry.entry_id}",
+        is_fixable=False,
+        is_persistent=False,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key=ISSUE_ACCOUNT_AUTH_FAILED,
+        translation_placeholders={"entry_title": entry.title},
+    )
+    _LOGGER.info("Created account_auth_failed repair issue for %s", entry.entry_id)
+
+
+async def async_delete_account_auth_issue(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> None:
+    """Delete the account-auth issue once an account call succeeds again."""
+    ir.async_delete_issue(
+        hass,
+        DOMAIN,
+        f"{ISSUE_ACCOUNT_AUTH_FAILED}_{entry.entry_id}",
     )
 
 

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from custom_components.govee.api.exceptions import (
+    Govee2FARequiredError,
     GoveeApiError,
     GoveeAuthError,
     GoveeDeviceNotFoundError,
@@ -2082,6 +2084,725 @@ class TestWaterDetectorPoll:
         assert coord._states[did].water_leak is None
 
 
+class TestBffTokenRefresh:
+    """An expired account token is refreshed and the BFF call retried.
+
+    The account bearer token cached in ``entry.data`` is reused across restarts
+    and nothing refreshed it, so once Govee expired it every leak entity went
+    unavailable until the user reconfigured the integration by hand. MQTT keeps
+    running off its long-lived certificate, which hides the failure.
+    """
+
+    def _coord(self):
+        import custom_components.govee.coordinator as coord_mod
+
+        hass = MagicMock()
+        config_entry = MagicMock()
+        config_entry.entry_id = "test_entry"
+        config_entry.data = {
+            "api_key": "key",
+            "email": "user@example.com",
+            "password": "pw",
+            "iot_credentials": {"token": "expired"},
+        }
+        coord = coord_mod.GoveeCoordinator(
+            hass=hass,
+            config_entry=config_entry,
+            api_client=MagicMock(),
+            iot_credentials=MagicMock(token="expired"),
+            poll_interval=60,
+        )
+        coord.async_update_listeners = MagicMock()
+        coord.async_set_updated_data = MagicMock()
+        coord._schedule_bff_poll = MagicMock()
+        # The budget is module-scoped so it survives reloads; isolate tests.
+        coord_mod._LOGIN_ATTEMPTS.pop(config_entry.entry_id, None)
+        return coord, coord_mod
+
+    @staticmethod
+    def _client(fetch):
+        """Build an auth-client mock with the diagnostics accessors stubbed."""
+        inner = MagicMock()
+        inner.fetch_bff_leak_sensors = fetch
+        inner.bff_device_census = MagicMock(return_value=[])
+        inner.bff_response_skeleton = MagicMock(return_value=None)
+        inner.bff_device_values = MagicMock(return_value=[])
+        return inner
+
+    @pytest.mark.asyncio
+    async def test_discovery_relogins_and_retries_on_expired_token(self, monkeypatch):
+        """A GoveeAuthError triggers one re-login, then the retry succeeds."""
+        from custom_components.govee.api.exceptions import GoveeAuthError
+
+        coord, coord_mod = self._coord()
+        sensor = {
+            "device_id": "AA:BB:CC:DD:EE:FF:00:11",
+            "name": "Kitchen sink",
+            "sku": "H5058",
+            "hub_device_id": "07:23:5C:E7:53:5F:6F:0A",
+            "sno": 4,
+        }
+        calls: list[str] = []
+
+        async def _fetch(token, *_a, **_kw):
+            calls.append(token)
+            if token == "expired":
+                raise GoveeAuthError("BFF API auth failed (body 401)", code=401)
+            return ([sensor], {}, {})
+
+        inner = self._client(_fetch)
+        fresh = MagicMock(token="fresh")
+        inner.login = _make_async(fresh)
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+        monkeypatch.setattr(
+            coord_mod.dataclasses, "asdict", lambda _o: {"token": "fresh"}
+        )
+
+        await coord._discover_leak_sensors()
+
+        # Retried with the refreshed token and discovered the sensor.
+        assert calls == ["expired", "fresh"]
+        assert "AA:BB:CC:DD:EE:FF:00:11" in coord._leak_sensors
+        # Fresh credentials persisted so the next reload starts valid.
+        coord.hass.config_entries.async_update_entry.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_relogin_without_stored_credentials(self, monkeypatch):
+        """Without email/password there is nothing to refresh with."""
+        from custom_components.govee.api.exceptions import GoveeAuthError
+
+        coord, coord_mod = self._coord()
+        coord._config_entry.data = {"api_key": "key"}
+        calls: list[str] = []
+
+        async def _fetch(token, *_a, **_kw):
+            calls.append(token)
+            raise GoveeAuthError("BFF API auth failed (body 401)", code=401)
+
+        inner = self._client(_fetch)
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+
+        await coord._discover_leak_sensors()
+
+        # Attempted once, no retry, and no entities invented.
+        assert calls == ["expired"]
+        assert coord._leak_sensors == {}
+
+    @pytest.mark.asyncio
+    async def test_relogin_attempted_only_once(self, monkeypatch):
+        """A token that still fails after refresh must not loop."""
+        from custom_components.govee.api.exceptions import GoveeAuthError
+
+        coord, coord_mod = self._coord()
+        calls: list[str] = []
+
+        async def _fetch(token, *_a, **_kw):
+            calls.append(token)
+            raise GoveeAuthError("BFF API auth failed (body 401)", code=401)
+
+        inner = self._client(_fetch)
+        inner.login = _make_async(MagicMock(token="fresh"))
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+        monkeypatch.setattr(
+            coord_mod.dataclasses, "asdict", lambda _o: {"token": "fresh"}
+        )
+
+        await coord._discover_leak_sensors()
+
+        assert calls == ["expired", "fresh"]
+
+    @pytest.mark.asyncio
+    async def test_poll_also_refreshes_expired_token(self, monkeypatch):
+        """The 5-minute poll recovers on its own, without a restart."""
+        from custom_components.govee.api.exceptions import GoveeAuthError
+        from custom_components.govee.models.device import GoveeLeakSensor
+
+        coord, coord_mod = self._coord()
+        did = "AA:BB:CC:DD:EE:FF:00:11"
+        coord._leak_sensors[did] = GoveeLeakSensor(
+            device_id=did,
+            name="Kitchen sink",
+            sku="H5058",
+            hub_device_id="07:23:5C:E7:53:5F:6F:0A",
+            sno=4,
+        )
+        calls: list[str] = []
+
+        async def _fetch(token, *_a, **_kw):
+            calls.append(token)
+            if token == "expired":
+                raise GoveeAuthError("BFF API auth failed (body 401)", code=401)
+            return ([], {}, {})
+
+        inner = self._client(_fetch)
+        inner.login = _make_async(MagicMock(token="fresh"))
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+        monkeypatch.setattr(coord_mod, "async_dispatcher_send", MagicMock())
+        monkeypatch.setattr(
+            coord_mod.dataclasses, "asdict", lambda _o: {"token": "fresh"}
+        )
+
+        await coord._poll_bff_leak_state()
+
+        assert calls == ["expired", "fresh"]
+
+
+class TestAccountTokenRefreshBoundary:
+    """Every account-token consumer recovers, not just the leak snapshot.
+
+    Detection was centralized in the auth layer but recovery originally lived
+    only in the leak path, so a thermometer-only or water-detector-only install
+    stayed silently stale after the token expired — the same failure this fix
+    exists to remove.
+    """
+
+    def _coord(self):
+        import custom_components.govee.coordinator as coord_mod
+
+        hass = MagicMock()
+        config_entry = MagicMock()
+        config_entry.entry_id = "test_entry"
+        config_entry.data = {
+            "api_key": "key",
+            "email": "user@example.com",
+            "password": "pw",
+            "iot_credentials": {"token": "expired"},
+        }
+        coord = coord_mod.GoveeCoordinator(
+            hass=hass,
+            config_entry=config_entry,
+            api_client=MagicMock(),
+            iot_credentials=MagicMock(token="expired"),
+            poll_interval=60,
+        )
+        coord.async_update_listeners = MagicMock()
+        coord.async_set_updated_data = MagicMock()
+        coord._schedule_bff_poll = MagicMock()
+        # The budget is module-scoped so it survives reloads; isolate tests.
+        coord_mod._LOGIN_ATTEMPTS.pop(config_entry.entry_id, None)
+        return coord, coord_mod
+
+    @staticmethod
+    def _patch_client(monkeypatch, coord_mod, inner):
+        inner.login = _make_async(MagicMock(token="fresh"))
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+        monkeypatch.setattr(
+            coord_mod.dataclasses, "asdict", lambda _o: {"token": "fresh"}
+        )
+        return inner
+
+    @staticmethod
+    def _discovery_client(monkeypatch, coord, coord_mod, results):
+        """`results` are per-attempt: an Exception to raise, or (sensors, census)."""
+        attempts: list[str] = []
+
+        async def _sensors(token, *_a, **_kw):
+            outcome = results[min(len(attempts), len(results) - 1)]
+            attempts.append(token)
+            if isinstance(outcome, Exception):
+                raise outcome
+            sensors, census = outcome
+            inner.bff_device_census = MagicMock(return_value=census)
+            return (sensors, {}, {})
+
+        inner = MagicMock()
+        inner.fetch_bff_leak_sensors = _sensors
+        inner.bff_device_census = MagicMock(return_value=[])
+        inner.bff_response_skeleton = MagicMock(return_value={})
+        inner.bff_device_values = MagicMock(return_value={})
+        TestAccountTokenRefreshBoundary._patch_client(monkeypatch, coord_mod, inner)
+        coord._poll_bff_leak_state = _make_async(None)
+        coord._refresh_bff_thermometers = _make_async(None)
+        return attempts
+
+    @staticmethod
+    def _leak_sensor_payload():
+        return {
+            "device_id": "AA:BB:CC:DD:EE:FF:00:77",
+            "name": "Washer",
+            "sku": "H5058",
+            "hub_device_id": "HUB",
+            "sno": 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_failed_discovery_is_retried_by_the_poll_loop(self, monkeypatch):
+        """Startup discovery is one-shot; a failure must not wedge leak state.
+
+        If it fails and nothing re-runs it, the roster stays empty, the BFF poll
+        early-returns forever, and leak detection is dead until a manual reload.
+        """
+        coord, coord_mod = self._coord()
+        coord._schedule_bff_poll = MagicMock()
+        attempts = self._discovery_client(
+            monkeypatch,
+            coord,
+            coord_mod,
+            [GoveeApiError("BFF unreachable"), ([self._leak_sensor_payload()], [{}])],
+        )
+
+        await coord._discover_leak_sensors()
+        assert coord._leak_discovery_retry_pending is True
+        assert coord._schedule_bff_poll.called, "no retry cycle was armed"
+
+        await coord._bff_poll_callback()
+
+        assert len(attempts) == 2, "poll loop did not re-run discovery"
+        # The retry must actually deliver a roster, not merely stop raising.
+        assert coord._leak_sensors, "retry produced no leak sensors"
+        assert coord._leak_discovery_retry_pending is False
+        # ...and the roster alone is not the outcome. Entities are created only
+        # during setup, so without a reload the data returns and the device
+        # still has no entity — the failure this retry exists to end.
+        assert (
+            coord.hass.config_entries.async_schedule_reload.called
+        ), "roster recovered but nothing materializes the entities"
+
+    @pytest.mark.asyncio
+    async def test_empty_payload_stays_armed(self, monkeypatch):
+        """A 200 with nothing in it is a degraded read, not an answer.
+
+        Clearing on "didn't raise" disarms the retry permanently and leaks the
+        same failure the retry exists to cover.
+        """
+        coord, coord_mod = self._coord()
+        coord._schedule_bff_poll = MagicMock()
+        self._discovery_client(monkeypatch, coord, coord_mod, [([], [])])
+
+        await coord._discover_leak_sensors()
+
+        assert coord._leak_discovery_retry_pending is True
+        assert coord._schedule_bff_poll.called, "degraded read left no way back"
+
+    @pytest.mark.asyncio
+    async def test_account_with_no_leak_sensors_stops_retrying(self, monkeypatch):
+        """The census answered; this account simply has none. Don't loop forever."""
+        coord, coord_mod = self._coord()
+        coord._schedule_bff_poll = MagicMock()
+        self._discovery_client(
+            monkeypatch, coord, coord_mod, [([], [{"device": "a-bulb"}])]
+        )
+
+        await coord._discover_leak_sensors()
+
+        assert coord._leak_discovery_retry_pending is False
+
+    @pytest.mark.asyncio
+    async def test_durable_auth_failure_raises_and_clears_a_repair_card(
+        self, monkeypatch
+    ):
+        """Account-auth death needs a terminal state, not just a log line."""
+        coord, coord_mod = self._coord()
+
+        async def _dead(*_a, **_kw):
+            raise GoveeAuthError("nope", code=401)
+
+        monkeypatch.setattr(coord, "_async_refresh_iot_token", _make_async(False))
+        created, deleted = [], []
+
+        async def _create(*_a, **_kw):
+            created.append(1)
+
+        async def _delete(*_a, **_kw):
+            deleted.append(1)
+
+        monkeypatch.setattr(coord_mod, "async_create_account_auth_issue", _create)
+        monkeypatch.setattr(coord_mod, "async_delete_account_auth_issue", _delete)
+
+        with pytest.raises(GoveeAuthError):
+            await coord._run_account_call(_dead)
+        assert created, "no repair card for a durable account-auth failure"
+
+        # Recovery must retract it, or the card outlives the problem.
+        monkeypatch.setattr(coord, "_run_account_call_once", _make_async("ok"))
+        await coord._run_account_call(_dead)
+        assert deleted, "card never cleared after recovery"
+
+    @pytest.mark.asyncio
+    async def test_thermometer_refresh_recovers(self, monkeypatch):
+        """DR-001: a thermo-only install must self-heal after expiry."""
+        coord, coord_mod = self._coord()
+        coord._bff_thermometer_ids = {"AA:BB:CC:DD:EE:FF:00:22"}
+        calls: list[str] = []
+
+        async def _fetch(token, *_a, **_kw):
+            calls.append(token)
+            if token == "expired":
+                raise GoveeAuthError("BFF auth failed (body 401)", code=401)
+            return []
+
+        inner = MagicMock()
+        inner.fetch_bff_thermo_hygrometers = _fetch
+        self._patch_client(monkeypatch, coord_mod, inner)
+
+        await coord._refresh_bff_thermometers()
+
+        assert calls == ["expired", "fresh"]
+
+    @pytest.mark.asyncio
+    async def test_water_detector_poll_recovers(self, monkeypatch):
+        """DR-002: the H5054 poll must refresh instead of looping on a dead token."""
+        coord, coord_mod = self._coord()
+        did = "AA:BB:CC:DD:EE:FF:00:33"
+        coord._devices[did] = GoveeDevice(
+            device_id=did,
+            sku="H5054",
+            name="Washer",
+            device_type="devices.types.sensor",
+            capabilities=(
+                GoveeCapability(
+                    type="devices.capabilities.event",
+                    instance="bodyAppearedEvent",
+                    parameters={},
+                ),
+            ),
+            is_group=False,
+        )
+        coord._states[did] = GoveeDeviceState.create_empty(did)
+        calls: list[str] = []
+
+        async def _states(token, *_a, **_kw):
+            calls.append(token)
+            if token == "expired":
+                raise GoveeAuthError("BFF auth failed (body 401)", code=401)
+            return {}
+
+        inner = MagicMock()
+        inner.fetch_water_detector_states = _states
+        self._patch_client(monkeypatch, coord_mod, inner)
+
+        await coord._poll_water_detectors()
+
+        assert calls == ["expired", "fresh"]
+
+    @pytest.mark.asyncio
+    async def test_failed_refresh_backs_off(self, monkeypatch):
+        """Govee allows 30 logins/24h — a dead credential must not retry per tick."""
+        coord, coord_mod = self._coord()
+        logins: list[int] = []
+
+        async def _login(*_a, **_kw):
+            logins.append(1)
+            raise GoveeAuthError("2FA required", code=454)
+
+        inner = MagicMock()
+        inner.login = _login
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+
+        assert await coord._async_refresh_iot_token() is False
+        assert await coord._async_refresh_iot_token() is False
+
+        # Second attempt suppressed by the backoff window.
+        assert len(logins) == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_backoff_ramps_within_login_budget(self, monkeypatch):
+        """Govee allows 30 logins/24h; the ramp must not exceed that."""
+        coord, coord_mod = self._coord()
+
+        async def _login(*_a, **_kw):
+            raise GoveeApiError("Connection error during login")
+
+        inner = MagicMock()
+        inner.login = _login
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+
+        waits: list[float] = []
+        for _ in range(6):
+            coord._token_refresh_blocked_until = 0.0  # simulate the wait elapsing
+            assert await coord._async_refresh_iot_token() is False
+            waits.append(coord._token_refresh_blocked_until - time.time())
+
+        # 5m, 10m, 20m, 40m, then capped at the hour.
+        assert waits[0] <= coord_mod.TOKEN_REFRESH_TRANSIENT_BACKOFF
+        assert waits[1] > waits[0]
+        assert all(w <= coord_mod.TOKEN_REFRESH_BACKOFF + 1 for w in waits)
+        assert waits[-1] > coord_mod.TOKEN_REFRESH_BACKOFF - 60
+
+        # Worst-case attempts in 24h must stay under Govee's cap.
+        elapsed = 0.0
+        attempts = 0
+        failures = 0
+        while elapsed < 86400:
+            failures += 1
+            attempts += 1
+            elapsed += min(
+                coord_mod.TOKEN_REFRESH_TRANSIENT_BACKOFF * 2 ** (failures - 1),
+                coord_mod.TOKEN_REFRESH_BACKOFF,
+            )
+        assert attempts <= 30, f"{attempts} logins/24h exceeds Govee's budget"
+
+    @pytest.mark.asyncio
+    async def test_flapping_success_cannot_outspend_the_budget(self, monkeypatch):
+        """A login that succeeds but yields a still-rejected token resets the
+        ramp, so only the rolling budget stops a re-login every poll tick."""
+        coord, coord_mod = self._coord()
+        logins: list[int] = []
+
+        async def _login(*_a, **_kw):
+            logins.append(1)
+            return MagicMock(token="fresh")
+
+        inner = MagicMock()
+        inner.login = _login
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+        monkeypatch.setattr(
+            coord_mod.dataclasses, "asdict", lambda _o: {"token": "fresh"}
+        )
+
+        # Every attempt "succeeds", so the ramp never engages.
+        for _ in range(coord_mod.LOGIN_BUDGET_MAX + 10):
+            coord._token_refresh_blocked_until = 0.0
+            await coord._async_refresh_iot_token()
+
+        assert len(logins) == coord_mod.LOGIN_BUDGET_MAX
+        assert len(logins) < 30  # Govee's documented cap
+
+    @pytest.mark.asyncio
+    async def test_budget_survives_a_config_entry_reload(self, monkeypatch):
+        """A reload discards instance state — the budget must not reset with it,
+        or it never bounds the case it exists for."""
+        coord, coord_mod = self._coord()
+        logins: list[int] = []
+
+        async def _login(*_a, **_kw):
+            logins.append(1)
+            return MagicMock(token="fresh")
+
+        inner = MagicMock()
+        inner.login = _login
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+        monkeypatch.setattr(
+            coord_mod.dataclasses, "asdict", lambda _o: {"token": "fresh"}
+        )
+
+        entry = coord._config_entry
+        for _ in range(coord_mod.LOGIN_BUDGET_MAX + 5):
+            # Rebuild the coordinator the way a reload does, same entry.
+            reloaded = coord_mod.GoveeCoordinator(
+                hass=coord.hass,
+                config_entry=entry,
+                api_client=MagicMock(),
+                iot_credentials=MagicMock(token="expired"),
+                poll_interval=60,
+            )
+            reloaded._token_refresh_blocked_until = 0.0
+            await reloaded._async_refresh_iot_token()
+
+        assert len(logins) == coord_mod.LOGIN_BUDGET_MAX
+
+    @pytest.mark.asyncio
+    async def test_budget_entries_age_out_of_the_window(self, monkeypatch):
+        """Yesterday's attempts must not permanently block recovery."""
+        coord, coord_mod = self._coord()
+        logins: list[int] = []
+
+        async def _login(*_a, **_kw):
+            logins.append(1)
+            return MagicMock(token="fresh")
+
+        inner = MagicMock()
+        inner.login = _login
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+        monkeypatch.setattr(
+            coord_mod.dataclasses, "asdict", lambda _o: {"token": "fresh"}
+        )
+
+        stale = time.time() - coord_mod.LOGIN_BUDGET_WINDOW - 1
+        coord._login_attempts.extend([stale] * coord_mod.LOGIN_BUDGET_MAX)
+
+        assert await coord._async_refresh_iot_token() is True
+        assert len(logins) == 1
+
+    @pytest.mark.asyncio
+    async def test_successful_refresh_resets_the_ramp(self, monkeypatch):
+        """A recovered account must not inherit the previous backoff growth."""
+        coord, coord_mod = self._coord()
+        coord._token_refresh_failures = 4
+
+        inner = MagicMock()
+        inner.login = _make_async(MagicMock(token="fresh"))
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+        monkeypatch.setattr(
+            coord_mod.dataclasses, "asdict", lambda _o: {"token": "fresh"}
+        )
+
+        assert await coord._async_refresh_iot_token() is True
+        assert coord._token_refresh_failures == 0
+        assert coord._token_refresh_blocked_until == 0.0
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_backs_off_briefly(self, monkeypatch):
+        """A network blip must not freeze recovery for a full hour."""
+        coord, coord_mod = self._coord()
+
+        async def _login(*_a, **_kw):
+            raise GoveeApiError("Connection error during login")
+
+        inner = MagicMock()
+        inner.login = _login
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+
+        assert await coord._async_refresh_iot_token() is False
+
+        remaining = coord._token_refresh_blocked_until - time.time()
+        assert remaining <= coord_mod.TOKEN_REFRESH_TRANSIENT_BACKOFF
+        assert remaining < coord_mod.TOKEN_REFRESH_BACKOFF
+
+    @pytest.mark.asyncio
+    async def test_durable_failure_backs_off_fully(self, monkeypatch):
+        """2FA needs a user-supplied code, so waiting the full hour is correct."""
+        coord, coord_mod = self._coord()
+
+        async def _login(*_a, **_kw):
+            raise Govee2FARequiredError()
+
+        inner = MagicMock()
+        inner.login = _login
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+
+        assert await coord._async_refresh_iot_token() is False
+
+        remaining = coord._token_refresh_blocked_until - time.time()
+        assert remaining > coord_mod.TOKEN_REFRESH_TRANSIENT_BACKOFF
+
+    @pytest.mark.asyncio
+    async def test_retry_still_notifies_for_a_change_made_before_the_401(
+        self, monkeypatch
+    ):
+        """A change written pre-401 compares equal on retry; it must still fire.
+
+        The refresh re-runs the whole closure, so a device resolved on the first
+        attempt is a no-op on the second. Losing the notification there leaves
+        the UI stale until the next coordinator tick.
+        """
+        coord, coord_mod = self._coord()
+        first, second = "AA:BB:CC:DD:EE:FF:00:51", "AA:BB:CC:DD:EE:FF:00:52"
+        for did in (first, second):
+            coord._devices[did] = GoveeDevice(
+                device_id=did,
+                sku="H5054",
+                name="Washer",
+                device_type="devices.types.sensor",
+                capabilities=(
+                    GoveeCapability(
+                        type="devices.capabilities.event",
+                        instance="bodyAppearedEvent",
+                        parameters={},
+                    ),
+                ),
+                is_group=False,
+            )
+            state = GoveeDeviceState.create_empty(did)
+            coord._states[did] = state
+        # Only this one changes, and only on the first attempt. The second is
+        # already dry, so on retry neither device moves — without carrying the
+        # flag across attempts there is nothing left to notify about.
+        coord._states[first].water_leak = True
+        coord._states[second].water_leak = False
+
+        async def _states(token, *_a, **_kw):
+            return {
+                did: {"online": True, "gateway_online": True, "last_time": 1}
+                for did in (first, second)
+            }
+
+        async def _warn(token, device_id, *_a, **_kw):
+            # First device resolves wet -> dry, then the token dies mid-cycle.
+            if device_id == second and token == "expired":
+                raise GoveeAuthError("warnMessage auth failed (401)", code=401)
+            return False
+
+        inner = MagicMock()
+        inner.fetch_water_detector_states = _states
+        inner.fetch_leak_warning = _warn
+        self._patch_client(monkeypatch, coord_mod, inner)
+
+        notified = MagicMock()
+        coord.async_update_listeners = notified
+
+        await coord._poll_water_detectors()
+
+        assert coord._states[first].water_leak is False
+        assert coord._states[second].water_leak is False
+        assert notified.called, "listeners never heard about the resolved change"
+
+    @pytest.mark.asyncio
+    async def test_warn_message_auth_failure_recovers(self, monkeypatch):
+        """warnMessage 401s must reach the shared boundary, not latch the state."""
+        coord, coord_mod = self._coord()
+        did = "AA:BB:CC:DD:EE:FF:00:44"
+        coord._devices[did] = GoveeDevice(
+            device_id=did,
+            sku="H5054",
+            name="Washer",
+            device_type="devices.types.sensor",
+            capabilities=(
+                GoveeCapability(
+                    type="devices.capabilities.event",
+                    instance="bodyAppearedEvent",
+                    parameters={},
+                ),
+            ),
+            is_group=False,
+        )
+        state = GoveeDeviceState.create_empty(did)
+        state.water_leak = True  # already wet -> warnMessage is re-checked
+        coord._states[did] = state
+        warn_calls: list[str] = []
+
+        async def _states(token, *_a, **_kw):
+            return {did: {"online": True, "gateway_online": True, "last_time": 1}}
+
+        async def _warn(token, *_a, **_kw):
+            warn_calls.append(token)
+            if token == "expired":
+                raise GoveeAuthError("warnMessage auth failed (401)", code=401)
+            return False
+
+        inner = MagicMock()
+        inner.fetch_water_detector_states = _states
+        inner.fetch_leak_warning = _warn
+        self._patch_client(monkeypatch, coord_mod, inner)
+
+        await coord._poll_water_detectors()
+
+        # Retried with the refreshed token instead of silently keeping "wet".
+        assert warn_calls == ["expired", "fresh"]
+        assert coord._states[did].water_leak is False
+
+    @pytest.mark.asyncio
+    async def test_concurrent_callers_share_one_login(self, monkeypatch):
+        """Overlapping pollers hitting an expired token must not each re-login."""
+        coord, coord_mod = self._coord()
+        logins: list[int] = []
+
+        async def _login(*_a, **_kw):
+            logins.append(1)
+            await asyncio.sleep(0)
+            return MagicMock(token="fresh")
+
+        async def _fetch(token, *_a, **_kw):
+            if token == "expired":
+                raise GoveeAuthError("BFF auth failed (body 401)", code=401)
+            return []
+
+        inner = MagicMock()
+        inner.login = _login
+        inner.fetch_bff_thermo_hygrometers = _fetch
+        monkeypatch.setattr(coord_mod, "GoveeAuthClient", lambda **kw: _AsyncCM(inner))
+        monkeypatch.setattr(
+            coord_mod.dataclasses, "asdict", lambda _o: {"token": "fresh"}
+        )
+
+        await asyncio.gather(
+            coord._run_account_call(lambda c, t: c.fetch_bff_thermo_hygrometers(t)),
+            coord._run_account_call(lambda c, t: c.fetch_bff_thermo_hygrometers(t)),
+        )
+
+        assert len(logins) == 1
+
+
 class _AsyncCM:
     """Minimal async context manager yielding a configured inner mock."""
 
@@ -2171,6 +2892,8 @@ class TestBffThermometerDiscovery:
         coord.async_update_listeners = MagicMock()
         coord.async_set_updated_data = MagicMock()
         coord._schedule_bff_poll = MagicMock()
+        # The budget is module-scoped so it survives reloads; isolate tests.
+        coord_mod._LOGIN_ATTEMPTS.pop(config_entry.entry_id, None)
         return coord, coord_mod
 
     @pytest.mark.asyncio
@@ -2422,6 +3145,8 @@ class TestBffThermoTickleOnly:
         coord.async_update_listeners = MagicMock()
         coord.async_set_updated_data = MagicMock()
         coord._schedule_bff_poll = MagicMock()
+        # The budget is module-scoped so it survives reloads; isolate tests.
+        coord_mod._LOGIN_ATTEMPTS.pop(config_entry.entry_id, None)
         return coord, coord_mod
 
     @pytest.mark.asyncio

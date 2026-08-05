@@ -103,6 +103,41 @@ def _sanitize_response_for_logging(data: Any) -> Any:
     return sanitized
 
 
+def _raise_for_body_status(data: Any, context: str) -> None:
+    """Raise when a 200-OK Govee response carries a non-200 body status.
+
+    The app2 BFF endpoints answer an expired account bearer token with
+    HTTP 200 and a body of ``{"status": 401, "message": "authorization token
+    is invalid"}`` alongside an empty ``data.devices`` list, so the HTTP
+    status alone looks like success. Without inspecting the body, discovery
+    parses zero devices and every leak / thermo entity silently drops to
+    unavailable instead of raising an auth error the coordinator can act on.
+
+    Also applied to the legacy (non-BFF) device list, whose success bodies
+    simply omit ``status`` — the absent-key path returns quietly rather than
+    treating a missing field as a failure.
+
+    Args:
+        data: Parsed JSON body from a BFF response.
+        context: Short description of the call, used in the error message.
+
+    Raises:
+        GoveeAuthError: Body status is 401 (token expired or invalid).
+        GoveeApiError: Body status is any other non-200 value.
+    """
+    if not isinstance(data, dict):
+        return
+
+    status = data.get("status")
+    if status is None or status == 200:
+        return
+
+    message = data.get("message", f"status {status}")
+    if status == 401:
+        raise GoveeAuthError(f"{context} auth failed (body 401): {message}", code=401)
+    raise GoveeApiError(f"{context} failed: {message}", code=status)
+
+
 # 12+ hex chars (with or without separators) — catches MAC-derived ids used as
 # dict keys, which must not appear in the PII-free skeleton.
 _HEXKEY_RE = re.compile(r"^[0-9A-Fa-f]{2}([:_-]?[0-9A-Fa-f]{2}){5,}$")
@@ -601,11 +636,14 @@ class GoveeAuthClient:
             headers=headers,
         ) as response:
             data = await response.json()
+            if response.status == 401:
+                raise GoveeAuthError("BFF device list auth failed (401)")
             if response.status != 200:
                 message = data.get("message", f"HTTP {response.status}")
                 raise GoveeApiError(
                     f"BFF device list failed: {message}", code=response.status
                 )
+            _raise_for_body_status(data, "BFF device list")
             devices = data.get("data", {}).get("devices", [])
             return self._extract_topics_from_devices(devices)
 
@@ -643,11 +681,15 @@ class GoveeAuthClient:
             ) as response:
                 data = await response.json()
 
+                if response.status == 401:
+                    raise GoveeAuthError("Device list auth failed (401)")
                 if response.status != 200:
                     message = data.get("message", f"HTTP {response.status}")
                     raise GoveeApiError(
                         f"Failed to get device list: {message}", code=response.status
                     )
+
+                _raise_for_body_status(data, "Device list")
 
                 # Extract topics from the legacy list (structure:
                 # devices[].deviceExt.deviceSettings.topic), then merge in topics
@@ -661,6 +703,10 @@ class GoveeAuthClient:
                 added = 0
                 try:
                     bff_topics = await self._fetch_bff_device_topics(token)
+                except GoveeAuthError:
+                    # An expired token is recoverable upstream, so it must not
+                    # be absorbed by the best-effort supplement.
+                    raise
                 except Exception as err:  # noqa: BLE001
                     # Best-effort supplement: the BFF merge must never regress the
                     # legacy topic set, so any failure is swallowed (non-fatal).
@@ -733,6 +779,8 @@ class GoveeAuthClient:
                         f"BFF device list failed: {message}",
                         code=response.status,
                     )
+
+                _raise_for_body_status(data, "BFF device list")
 
                 devices = data.get("data", {}).get("devices", [])
                 # Retain for the diagnostics census (#87 / #86 triage).
@@ -898,6 +946,8 @@ class GoveeAuthClient:
                         f"BFF device list failed: {message}",
                         code=response.status,
                     )
+
+                _raise_for_body_status(data, "BFF device list")
 
                 sensors: list[dict[str, Any]] = []
                 devices = data.get("data", {}).get("devices", [])
@@ -1146,6 +1196,8 @@ class GoveeAuthClient:
                         f"BFF device list failed: {message}", code=response.status
                     )
 
+                _raise_for_body_status(data, "BFF device list")
+
                 for device in data.get("data", {}).get("devices", []):
                     raw_id = device.get("device", "")
                     key = raw_id.replace(":", "").upper()
@@ -1233,6 +1285,8 @@ class GoveeAuthClient:
                         f"warnMessage failed: {message}", code=response.status
                     )
 
+                _raise_for_body_status(data, "warnMessage")
+
                 messages = data.get("data", [])
                 if not isinstance(messages, list):
                     return False
@@ -1268,6 +1322,12 @@ class GoveeAuthClient:
         — with no MACs or names. Lets a diagnostics download answer "does the
         BFF return this leak SKU, and does our SKU allowlist / parser match it?"
         without exposing identities or needing verbose logging.
+
+        Load-bearing beyond diagnostics: the coordinator reads emptiness here to
+        tell "the BFF answered, this account has no leak sensors" from "the read
+        was degraded", which decides whether leak discovery keeps retrying. Keep
+        it 1:1 with the raw device list — filtering it would silently strand
+        leak detection after a failed startup.
         """
         census: list[dict[str, Any]] = []
         for device in self._last_bff_raw_devices:

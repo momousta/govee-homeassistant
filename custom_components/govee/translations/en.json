@@ -382,6 +382,10 @@
     "mqtt_2fa_required": {
       "title": "Govee account requires verification",
       "description": "Your Govee account now requires email verification (2FA) to enable real-time MQTT updates for {entry_title}. Go to the integration page and select **Reconfigure** to re-enter your credentials with a verification code.\n\nThe integration will continue to work using polling until this is resolved."
+    },
+    "account_auth_failed": {
+      "title": "Govee account sign-in failed",
+      "description": "The Govee account email or password saved for {entry_title} is no longer working, so anything that needs the account API — leak sensors, hub-attached sensors and thermo-hygrometer readings — will stop updating. Lights and switches keep working, because they use the API key.\n\nUpdate the account credentials from the integration's Reconfigure option. The API key repair flow cannot fix this one. This notice clears itself as soon as an account call succeeds again."
     }
   }
 }

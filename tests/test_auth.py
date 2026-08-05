@@ -1063,6 +1063,37 @@ class TestFetchDeviceTopicsHeaders:
         # Assert
         assert topics["DEV:1"] == "GD/legacy"
 
+    @pytest.mark.asyncio
+    async def test_fetch_device_topics_propagates_bff_auth_failure(self):
+        """An expired token must escape the supplement so the caller can refresh."""
+        legacy_resp = make_mock_response(
+            200,
+            create_device_list_response(
+                [
+                    {
+                        "device": "DEV:1",
+                        "deviceExt": {"deviceSettings": {"topic": "GD/legacy"}},
+                    }
+                ]
+            ),
+        )
+        expired = make_mock_response(
+            200,
+            {
+                "status": 401,
+                "message": "authorization token is invalid",
+                "data": {"devices": []},
+            },
+        )
+        session = MagicMock(spec=aiohttp.ClientSession)
+        session.close = AsyncMock()
+        session.post = lambda *a, **kw: _async_cm(legacy_resp)
+        session.get = lambda *a, **kw: _async_cm(expired)
+        client = GoveeAuthClient(session=session)
+
+        with pytest.raises(GoveeAuthError):
+            await client.fetch_device_topics(token="expired")
+
 
 class TestExtractTopicsFromDevices:
     """Test the shared device-list topic-extraction helper."""
@@ -1677,6 +1708,126 @@ class TestBffLeakDiscovery:
         assert sensor["sku"] == "H5059"
         assert sensor["sno"] == 2  # aligns with multiSync packet byte 2
         assert sensor["hub_device_id"] == hub
+
+
+class TestBffExpiredTokenBodyStatus:
+    """An expired account token answers HTTP 200 with an in-body 401.
+
+    Govee's BFF endpoints do not return an HTTP 401 when the account bearer
+    token expires: they answer ``200 OK`` with ``{"status": 401, "message":
+    "authorization token is invalid"}`` and an empty device list. Treating that
+    as success silently discovers zero leak sensors and drops every leak entity
+    to unavailable, so the body status must be surfaced as an auth failure.
+    """
+
+    @staticmethod
+    def _expired_body() -> dict[str, Any]:
+        """Return the exact envelope Govee sends for an expired token."""
+        return {
+            "status": 401,
+            "message": "authorization token is invalid",
+            "data": {"devices": []},
+        }
+
+    @pytest.mark.asyncio
+    async def test_leak_discovery_raises_auth_error_on_body_401(self):
+        """fetch_bff_leak_sensors must not report zero sensors for a dead token."""
+        session = make_session_get(make_mock_response(200, self._expired_body()))
+        client = GoveeAuthClient(session=session)
+
+        with pytest.raises(GoveeAuthError):
+            await client.fetch_bff_leak_sensors(token="expired")
+
+    @pytest.mark.asyncio
+    async def test_thermo_discovery_raises_auth_error_on_body_401(self):
+        """The thermo-hygrometer path shares the endpoint and the failure mode."""
+        session = make_session_get(make_mock_response(200, self._expired_body()))
+        client = GoveeAuthClient(session=session)
+
+        with pytest.raises(GoveeAuthError):
+            await client.fetch_bff_thermo_hygrometers(token="expired")
+
+    @pytest.mark.asyncio
+    async def test_water_detector_states_raise_auth_error_on_body_401(self):
+        """Water-detector state polling must surface the dead token too."""
+        session = make_session_get(make_mock_response(200, self._expired_body()))
+        client = GoveeAuthClient(session=session)
+
+        with pytest.raises(GoveeAuthError):
+            await client.fetch_water_detector_states(
+                token="expired", device_ids={"AA:BB:CC:DD:EE:FF:00:11"}
+            )
+
+    @pytest.mark.asyncio
+    async def test_warn_message_raises_auth_error_on_body_401(self):
+        """The one endpoint that writes leak state must not read 401 as "dry".
+
+        A body-401 has no unread alert in it, so an unguarded parse returns
+        False — silently reporting a wet sensor dry with no log and no refresh.
+        """
+        session = make_session_post(
+            [make_mock_response(200, {"status": 401, "message": "invalid"})]
+        )
+        client = GoveeAuthClient(session=session)
+
+        with pytest.raises(GoveeAuthError):
+            await client.fetch_leak_warning("expired", "dev", "H5054")
+
+    @pytest.mark.asyncio
+    async def test_non_auth_body_status_raises_api_error(self):
+        """A non-401 body status is a generic API failure, not an auth failure."""
+        body = {"status": 500, "message": "server error", "data": {"devices": []}}
+        session = make_session_get(make_mock_response(200, body))
+        client = GoveeAuthClient(session=session)
+
+        with pytest.raises(GoveeApiError):
+            await client.fetch_bff_leak_sensors(token="tok")
+
+    @pytest.mark.asyncio
+    async def test_body_status_200_is_not_an_error(self):
+        """A healthy response carrying status=200 still parses normally."""
+        hub = "07:23:5C:E7:53:5F:6F:0A"
+        body = {
+            "status": 200,
+            "message": "Success",
+            "data": {
+                "devices": [
+                    {
+                        "sku": "H5058",
+                        "device": "03:4E:CE:6D:FF:FF:FF:12",
+                        "deviceName": "kitchen sink",
+                        "deviceExt": json.dumps(
+                            {
+                                "deviceSettings": {
+                                    "sno": 4,
+                                    "battery": 100,
+                                    "gatewayInfo": {"device": hub, "sku": "H5043"},
+                                }
+                            }
+                        ),
+                    }
+                ]
+            },
+        }
+        session = make_session_get(make_mock_response(200, body))
+        client = GoveeAuthClient(session=session)
+
+        sensors, _hubs, _thermo = await client.fetch_bff_leak_sensors(token="tok")
+
+        assert len(sensors) == 1
+        assert sensors[0]["sno"] == 4
+
+    @pytest.mark.asyncio
+    async def test_response_without_body_status_still_parses(self):
+        """Responses that omit ``status`` (older shape) must keep working."""
+        session = make_session_get(make_mock_response(200, _bff_response([])))
+        client = GoveeAuthClient(session=session)
+
+        sensors, hubs, thermo = await client.fetch_bff_leak_sensors(token="tok")
+
+        assert sensors == []
+        assert hubs == {}
+        assert thermo == {}
 
 
 class TestBffDeviceCensus:

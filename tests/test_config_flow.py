@@ -911,10 +911,12 @@ class TestVerificationCodeFlow:
         # Verify async_update_reload_and_abort was called with correct data
         call_args = flow.async_update_reload_and_abort.call_args
         assert call_args[0][0] is mock_entry
-        data_updates = call_args[1]["data_updates"]
-        assert data_updates[CONF_EMAIL] == "new@example.com"
-        assert data_updates[CONF_PASSWORD] == "newpass"
-        assert data_updates[CONF_API_KEY] == "new-api-key-xxxx-xxxx-xxxx-xxxx-long"
+        # data=, not data_updates=: the union merge cannot remove keys, so
+        # "delete my credentials" never took effect and a stale token survived.
+        data = call_args[1]["data"]
+        assert data[CONF_EMAIL] == "new@example.com"
+        assert data[CONF_PASSWORD] == "newpass"
+        assert data[CONF_API_KEY] == "new-api-key-xxxx-xxxx-xxxx-xxxx-long"
 
     def test_verification_code_form_schema(self):
         """Test verification_code form has the correct schema."""
